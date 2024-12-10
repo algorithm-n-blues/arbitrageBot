@@ -2,3 +2,4 @@ aiohttp==3.8.5
 pandas==2.2.3
 streamlit==1.40.2
 requests==2.32.3
+# Add any other dependencies
