@@ -1,4 +1,4 @@
-aiohttp==3.8.5
+aiohttp==3.8.1
 pandas==2.2.3
 streamlit==1.40.2
 requests==2.32.3
