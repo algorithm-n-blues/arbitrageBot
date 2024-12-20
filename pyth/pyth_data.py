@@ -1,99 +1,88 @@
+import os
 import asyncio
 import aiohttp
 import logging
-import os
 import pandas as pd
-from uniswap import Uniswap
-from web3 import Web3
-from aave.aave_data import fetch_aave_data, get_best_tokens_for_flash_loans
+from .pyth_keys import pyth_keys
 
-# Initialize logger
+# Logger
 logging.basicConfig(level=logging.INFO)
 
-# Infura setup for Uniswap
-infura_url = "https://mainnet.infura.io/v3/8c665856b4df4e65ad71b86d08ec0a37"
-w3 = Web3(Web3.HTTPProvider(infura_url))
-uniswap = Uniswap(address=None, private_key=None, provider=infura_url, version=3)
+# Base URL for Pyth Network
+HERMES_BASE_URL = "https://hermes.pyth.network"
 
-# Sample symbol for testing - should match keys in `pyth_keys`
-symbol = "ETH/USD"
+async def fetch_pyth_network_prices(session, pyth_network_filtered_keys):
+    """
+    Fetch the latest price data from Pyth Network.
+    """
+    endpoint = "/v2/updates/price/latest"
+    prices_data = []
+    id_to_symbol = {v: k for k, v in pyth_network_filtered_keys.items()}
 
-# Function to compare prices and check for arbitrage opportunities
-def compare_prices(symbol, uniswap_price, pyth_prices):
-    # Find the Pyth price for the same symbol
-    pyth_price_data = pyth_prices.get(symbol)
-    if not pyth_price_data:
-        logging.warning(f"No Pyth price data found for symbol: {symbol}")
-        return None
+    try:
+        async with session.get(
+            f"{HERMES_BASE_URL}{endpoint}",
+            params={
+                "ids[]": list(pyth_network_filtered_keys.values()),
+                "encoding": "base64",
+                "parsed": "true",
+                "ignore_invalid_price_ids": "true"
+            },
+        ) as response:
+            response.raise_for_status()
+            json_data = await response.json()
 
-    pyth_price = pyth_price_data["Price"]
-    price_difference = abs(uniswap_price - pyth_price)
-    logging.info(f"Uniswap Price: {uniswap_price}, Pyth Price: {pyth_price}, Difference: {price_difference}")
+            for entry in json_data['parsed']:
+                entry_id = entry['id']
+                symbol = id_to_symbol.get(entry_id, "Unknown Symbol").split("/")[0]
 
-    # Check for arbitrage potential
-    if price_difference > 10:  # Arbitrary threshold, adjust as needed
-        logging.info("Arbitrage opportunity detected!")
-        return {
-            "symbol": symbol,
-            "uniswap_price": uniswap_price,
-            "pyth_price": pyth_price,
-            "price_difference": price_difference
-        }
-    else:
-        logging.info("No significant arbitrage opportunity.")
-        return None
+                if symbol == "Unknown Symbol":
+                    logging.warning(f"Unknown symbol for entry ID: {entry_id}")
+                    continue
 
-# Function to check Aave liquidity
-def check_aave_liquidity(aave_data, symbol):
-    # Locate the token's liquidity in Aave
-    for reserve in aave_data['reserves']:
-        if reserve['symbol'].lower() == symbol.lower():
-            available_liquidity = float(reserve['totalLiquidityUSD'])
-            logging.info(f"Aave liquidity for {symbol}: {available_liquidity}")
-            return available_liquidity > 100000  # Adjust as needed
-    return False
+                price_data = entry['price']
+                ema_price_data = entry.get('ema_price', {})
 
-# Save Pyth Data to CSV
+                price = float(price_data['price']) * (10 ** price_data['expo'])
+                price_conf = float(price_data.get('conf', 0)) * (10 ** price_data['expo'])
+                ema_price = float(ema_price_data.get('price', 0)) * (10 ** ema_price_data.get('expo', 0))
+                ema_conf = float(ema_price_data.get('conf', 0)) * (10 ** ema_price_data.get('expo', 0))
+
+                prices_data.append({
+                    "symbol": symbol,
+                    "Price": price,
+                    "EMA Price": ema_price,
+                    "Price Confidence": price_conf,
+                    "EMA Price Confidence": ema_conf,
+                })
+
+            logging.info(f"Pyth Network prices fetched successfully.")
+            return prices_data
+    except Exception as e:
+        logging.error(f"Exception during fetching price data: {str(e)}")
+        return []
+
+def get_pyth_data():
+    """
+    Fetch and return Pyth Network data.
+    """
+    async def main():
+        async with aiohttp.ClientSession() as session:
+            return await fetch_pyth_network_prices(session, pyth_keys)
+
+    # Run the async function safely using asyncio
+    return asyncio.run(main())
+
 def save_pyth_data_to_csv(pyth_data, filename):
     """
     Save Pyth Network price data to a CSV file.
-
-    Args:
-        pyth_data (list): List of price data dictionaries from Pyth Network.
-        filename (str): File path to save the CSV.
     """
-    # Ensure the data directory exists
     os.makedirs(os.path.dirname(filename), exist_ok=True)
 
     if pyth_data:
-        # Convert list of dictionaries to DataFrame
         df = pd.DataFrame(pyth_data)
-        
-        # Optional: Add timestamp column
         df["Timestamp"] = pd.Timestamp.now()
-        
-        # Save to CSV
         df.to_csv(filename, index=False)
         logging.info(f"Pyth Network price data saved to {filename}")
     else:
         logging.error("No Pyth Network data to save.")
-
-# Example Usage
-if __name__ == "__main__":
-    # Sample data
-    sample_pyth_data = [
-        {"symbol": "ETH/USD", "Price": 3720.12, "Confidence": 0.1},
-        {"symbol": "BTC/USD", "Price": 51200.00, "Confidence": 0.15},
-    ]
-    save_pyth_data_to_csv(sample_pyth_data, "data/pyth_prices.csv")
-
-# Main execution function
-async def main():
-    # Define Pyth Network keys for filtered tokens
-    pyth_network_filtered_keys = {
-        "ETH/USD": "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
-        "WBTC/USD": "c9d8b075a5c69303365ae23633d4e085199bf5c520a3b90fed1322a0342ffc33"
-    }
-
-# Run the main function
-asyncio.run(main())

@@ -1,20 +1,26 @@
 import os
+import aiohttp
 import logging
 import pandas as pd
 import streamlit as st
+import asyncio
+from datetime import datetime
 from uniswap_v3.fetch_uniswap import (
     save_uniswap_data_to_csv,
     fetch_top_uniswap_pools,
     fetch_pool_details,
 )
 from aave.aave_data import fetch_aave_data, save_aave_data_to_csv
-from pyth.pyth_data import save_pyth_data_to_csv
+from pyth.pyth_data import get_pyth_data, save_pyth_data_to_csv
 from utils import (
     add_timestamp,
     standardize_symbol,
     calculate_price_difference,
     estimate_arbitrage_profit,
-    calculate_weighted_tvl
+    calculate_weighted_tvl,
+    filter_pyth_prices,
+    get_last_updated_time,
+    is_file_outdated,
 )
 
 # Initialize logger
@@ -36,154 +42,196 @@ os.makedirs(DATA_DIRECTORY, exist_ok=True)
 API_KEY = "e12c2830e44d2ed329aa22ec5a73fb81"  # Replace with your Graph Gateway API key
 UNISWAP_ARBITRUM_URL = f"https://gateway.thegraph.com/api/{API_KEY}/subgraphs/id/5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV"
 
-def calculate_flash_loan_profitability(arbitrage_df):
+# Async helper to fetch Aave data
+async def fetch_aave_data_helper():
+    async with aiohttp.ClientSession() as session:
+        return await fetch_aave_data(session)
+
+def calculate_flash_loan_profitability(arbitrage_df, gas_cost_usd=10, loan_cap=1_000_000):
     """
-    Add columns for flash loan profitability analysis:
-    - Recommended Flash Loan Size
-    - Adjusted Net Profit for Flash Loan
+    Add flash loan profitability columns:
+    - Recommended Loan Size
+    - Adjusted Net Profit
     - ROI (%)
+
+    Args:
+        arbitrage_df (DataFrame): DataFrame with arbitrage results, including 'Net Profit' and 'Weighted Pyth TVL'.
+        gas_cost_usd (float): Gas cost in USD for executing the transaction.
+        loan_cap (float): Maximum loan size allowed in USD.
+
+    Returns:
+        DataFrame: Filtered DataFrame with flash loan profitability analysis.
     """
-    results = []
+    # Check for required columns
+    required_columns = ["Pool", "Weighted Pyth TVL", "Net Profit"]
+    missing_columns = [col for col in required_columns if col not in arbitrage_df.columns]
+    if missing_columns:
+        logger.error(f"Missing required columns for flash loan analysis: {missing_columns}")
+        st.error(f"Missing required columns for flash loan analysis: {missing_columns}")
+        return pd.DataFrame()
 
-    logging.info(f"Columns in arbitrage_df before calculate_weighted_tvl: {arbitrage_df.columns}")
-    arbitrage_df = calculate_weighted_tvl(arbitrage_df)
+    try:
+        # Ensure numeric conversion
+        arbitrage_df["Weighted Pyth TVL"] = pd.to_numeric(arbitrage_df["Weighted Pyth TVL"], errors="coerce")
+        arbitrage_df["Net Profit"] = pd.to_numeric(arbitrage_df["Net Profit"], errors="coerce")
 
-    for _, row in arbitrage_df.iterrows():
-        try:
-            pool_tvl = row["Weighted Pyth TVL"]  # Available liquidity
-            recommended_loan_size = min(pool_tvl, 1_000_000)  # Flash loan capped at $1M
-            
-            # Adjust Net Profit for loan size
-            adjusted_net_profit = row["Net Profit"] * (recommended_loan_size / pool_tvl)
-            
-            # ROI Calculation
-            roi = (adjusted_net_profit / recommended_loan_size) * 100
-            
-            results.append({
-                "Pool": row["Pool"],
-                "Net Profit": row["Net Profit"],
-                "Recommended Loan Size": recommended_loan_size,
-                "Adjusted Net Profit": adjusted_net_profit,
-                "ROI (%)": roi,
-            })
-        except Exception as e:
-            logger.error(f"Error in flash loan profitability calculations: {e}")
-            continue
+        # Recommended Loan Size: capped at the minimum between TVL and the loan_cap
+        arbitrage_df["Recommended Loan Size"] = arbitrage_df["Weighted Pyth TVL"].apply(
+            lambda tvl: min(tvl, loan_cap) if pd.notnull(tvl) else 0
+        )
 
-    return pd.DataFrame(results)
+        # Adjusted Net Profit: Scale net profit based on loan size relative to TVL
+        arbitrage_df["Adjusted Net Profit"] = arbitrage_df.apply(
+            lambda row: (row["Net Profit"] * row["Recommended Loan Size"] / row["Weighted Pyth TVL"])
+            if row["Weighted Pyth TVL"] > 0 else 0, axis=1
+        )
+
+        # ROI (%): Calculate return on investment percentage
+        arbitrage_df["ROI (%)"] = arbitrage_df.apply(
+            lambda row: (row["Adjusted Net Profit"] / row["Recommended Loan Size"] * 100)
+            if row["Recommended Loan Size"] > 0 else 0, axis=1
+        )
+
+        # Filter for profitable results: Adjusted Net Profit > Gas Cost
+        flash_loan_df = arbitrage_df[arbitrage_df["Adjusted Net Profit"] > gas_cost_usd].copy()
+        flash_loan_df = flash_loan_df.reset_index(drop=True)
+
+        logger.info("Flash Loan Profitability Analysis completed successfully.")
+    except Exception as e:
+        logger.error(f"Error calculating flash loan profitability: {e}")
+        st.error(f"Error calculating flash loan profitability: {e}")
+        return pd.DataFrame()
+
+    return flash_loan_df
 
 def streamlit_app():
     st.title("Arbitrage & Token Analytics Dashboard")
     st.write("Real-time data fetched from Uniswap, Pyth Network, and Aave.")
 
-    # --- Uniswap Data ---
+    # --- Fetch and Display Pyth Network Data ---
+    st.subheader("Pyth Network Prices")
+    pyth_file = os.path.join(DATA_DIRECTORY, "pyth_all_prices.csv")
+
+    # Check last updated timestamp
+    last_updated, is_outdated = None, True
+    if os.path.exists(pyth_file):
+        last_updated, is_outdated = get_last_updated_time(pyth_file), is_file_outdated(pyth_file)
+
+    st.write(f"Last updated at: {last_updated}" if last_updated else "No data available.")
+
+    # Refresh data if outdated or on button click
+    if is_outdated or st.button("Fetch Pyth Data"):
+        with st.spinner("Fetching Pyth Network data..."):
+            try:
+                pyth_data = get_pyth_data()
+                if pyth_data:
+                    save_pyth_data_to_csv(pyth_data, pyth_file)
+                    st.success("Pyth data fetched and saved successfully.")
+                else:
+                    st.error("Failed to fetch Pyth Network data.")
+            except Exception as e:
+                st.error(f"Error fetching Pyth data: {e}")
+                logger.error(f"Error fetching Pyth data: {e}")
+        last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.write(f"Last updated at: {last_updated}")
+
+    # Display Pyth data if exists
+    if os.path.exists(pyth_file):
+        pyth_df = pd.read_csv(pyth_file)
+        st.dataframe(pyth_df)
+    else:
+        st.warning("No Pyth Network data available. Fetch it first.")
+
+    # --- Fetch and Display Uniswap Data ---
     st.subheader("Uniswap Pool Explorer")
     sort_options = ["totalValueLockedUSD", "volumeUSD", "feeTier"]
     selected_sort = st.selectbox("Sort Pools By", sort_options, index=0)
 
-    uniswap_data = fetch_top_uniswap_pools(
-        UNISWAP_ARBITRUM_URL,
-        order_by=selected_sort,
-    )
+    uniswap_file = os.path.join(DATA_DIRECTORY, "uniswap_top_pools.csv")
 
-    if uniswap_data:
-        st.subheader("Uniswap Top Pools")
-        uniswap_df = pd.DataFrame(uniswap_data)
+    # Check last updated timestamp
+    last_updated, is_outdated = None, True
+    if os.path.exists(uniswap_file):
+        last_updated, is_outdated = get_last_updated_time(uniswap_file), is_file_outdated(uniswap_file)
 
-        # Ensure numeric conversion for relevant columns
-        numeric_columns = ["totalValueLockedUSD", "volumeUSD", "feeTier"]
-        for col in numeric_columns:
-            if col in uniswap_df.columns:
-                uniswap_df[col] = pd.to_numeric(uniswap_df[col], errors="coerce")
+    st.write(f"Last updated at: {last_updated}" if last_updated else "No data available.")
 
-        uniswap_df["token_pair"] = uniswap_df["token0_symbol"] + " / " + uniswap_df["token1_symbol"]
-        st.dataframe(uniswap_df)
-        logger.info(f"Uniswap Top Pools Data:\n{uniswap_df}")
+    if is_outdated or st.button("Fetch Uniswap Pools"):
+        with st.spinner("Fetching Uniswap data..."):
+            try:
+                uniswap_data = fetch_top_uniswap_pools(UNISWAP_ARBITRUM_URL, order_by=selected_sort)
+                logger.debug(f"Uniswap Data with Derived Prices: {uniswap_data}")
+                if uniswap_data:
+                    save_uniswap_data_to_csv(uniswap_data, uniswap_file)
+                    st.success("Uniswap data fetched and saved successfully.")
+                else:
+                    st.error("Failed to fetch Uniswap data.")
+            except Exception as e:
+                st.error(f"Error fetching Uniswap data: {e}")
+                logger.error(f"Error fetching Uniswap data: {e}")
+        last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.write(f"Last updated at: {last_updated}")
 
-        # Save Uniswap data
-        save_uniswap_data_to_csv(uniswap_data, os.path.join(DATA_DIRECTORY, "uniswap_top_pools.csv"))
-        logger.info("Uniswap pools data displayed and saved.")
+    # Display Uniswap data if exists
+    if os.path.exists(uniswap_file):
+        uniswap_df = pd.read_csv(uniswap_file)
 
-        # --- Pool Details ---
-        st.subheader("Uniswap Pool Details")
-        pool_id = st.selectbox(
-            "Select Pool ID for Details", [pool["id"] for pool in uniswap_data]
-        )
-        if pool_id:
-            pool_details = fetch_pool_details(pool_id)
-            if pool_details:
-                st.json(pool_details)
-                logger.info(f"Fetched Pool Details for ID {pool_id}:\n{pool_details}")
-            else:
-                st.error("Could not fetch details for the selected pool.")
-                logger.error(f"Failed to fetch details for pool ID: {pool_id}")
+        # Ensure derived price columns are present
+        if "price_token1_per_token0" in uniswap_df.columns and "price_token0_per_token1" in uniswap_df.columns:
+            st.dataframe(uniswap_df)
+        else:
+            st.warning("Uniswap data is missing derived prices. Please refresh the data.")
     else:
-        st.error("Uniswap data not available. Please fetch data first.")
-        logger.error("Failed to fetch Uniswap data.")
+        st.warning("No Uniswap data available. Fetch it first.")
 
-    # --- Pyth Network Data ---
-    st.subheader("Pyth Network Prices")
-    pyth_file = os.path.join(DATA_DIRECTORY, "pyth_all_prices.csv")
-    if os.path.exists(pyth_file):
-        pyth_df = pd.read_csv(pyth_file)
-        st.dataframe(pyth_df)
-        logger.info(f"Pyth Network Data:\n{pyth_df}")
-    else:
-        st.error("Pyth Network data not available. Please fetch data first.")
-        logger.warning("Pyth Network data file missing.")
-
-    # --- Aave Data ---
+    # --- Fetch and Display Aave Data ---
     st.subheader("Aave Top Reserves")
     aave_file = os.path.join(DATA_DIRECTORY, "arbitrum_aave_data.csv")
+
+    # Check last updated timestamp
+    last_updated, is_outdated = None, True
+    if os.path.exists(aave_file):
+        last_updated, is_outdated = get_last_updated_time(aave_file), is_file_outdated(aave_file)
+
+    st.write(f"Last updated at: {last_updated}" if last_updated else "No data available.")
+
+    if is_outdated or st.button("Fetch Aave Reserves"):
+        with st.spinner("Fetching Aave reserves..."):
+            try:
+                aave_data = asyncio.run(fetch_aave_data_helper())
+                if aave_data:
+                    save_aave_data_to_csv(aave_data, aave_file)
+                    st.success("Aave reserves fetched and saved successfully.")
+                else:
+                    st.error("Failed to fetch Aave data.")
+            except Exception as e:
+                st.error(f"Error fetching Aave data: {e}")
+                logger.error(f"Error fetching Aave data: {e}")
+        last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.write(f"Last updated at: {last_updated}")
+
+    # Display Aave data if exists
     if os.path.exists(aave_file):
         aave_df = pd.read_csv(aave_file)
         st.dataframe(aave_df)
-        logger.info(f"Aave Data:\n{aave_df}")
     else:
-        st.error("Aave data not available. Please fetch data first.")
-        logger.warning("Aave data file missing.")
+        st.warning("No Aave reserves data available. Fetch it first.")
 
-    # --- Price Comparisons ---
-    if os.path.exists(pyth_file) and uniswap_data:
-        st.subheader("Price Comparison and Arbitrage Opportunities")
-        pyth_data = pd.read_csv(pyth_file).to_dict("records")
-        comparison_df = calculate_price_difference(uniswap_data, pyth_data)
-
+    # --- Price Comparison ---
+    st.subheader("Price Comparison and Arbitrage Opportunities")
+    if os.path.exists(pyth_file) and os.path.exists(uniswap_file):
+        pyth_df = pd.read_csv(pyth_file)
+        uniswap_df = pd.read_csv(uniswap_file)
+        comparison_df = calculate_price_difference(uniswap_df.to_dict("records"), pyth_df.to_dict("records"))
+        logger.info(comparison_df)
         if not comparison_df.empty:
-            st.subheader("Price Comparison")
             st.dataframe(comparison_df)
-            logger.info(f"Price Comparison Data:\n{comparison_df}")
-
-            # --- Arbitrage Analysis Filters ---
-            st.subheader("Set Filters for Arbitrage Opportunities")
-            gas_price_gwei = st.slider("Gas Price (Gwei)", min_value=1, max_value=100, value=10, step=1)
-            gas_limit = st.number_input("Gas Limit", min_value=100000, max_value=1000000, value=300000, step=1000)
-            min_profit = st.number_input("Minimum Net Profit (USD)", min_value=0.0, value=1000.0, step=100.0)
-            max_slippage = st.slider("Maximum Slippage (%)", min_value=0.0, max_value=10.0, value=0.5, step=0.1)
-
-            arbitrage_df = estimate_arbitrage_profit(comparison_df, gas_price_gwei, gas_limit)
-
-            # --- Enhanced Analysis: Profitability ---
-            st.subheader("Flash Loan Profitability Analysis")
-            flash_loan_df = calculate_flash_loan_profitability(arbitrage_df)
-            st.dataframe(flash_loan_df)
-
-            if not flash_loan_df.empty:
-                profitable_opportunities = flash_loan_df[flash_loan_df["Net Profit"] > 0]
-                if not profitable_opportunities.empty:
-                    st.write("Profitable Opportunities (Net Profit > $0):")
-                    st.dataframe(profitable_opportunities)
-                else:
-                    st.warning("No profitable opportunities found after flash loan adjustments.")
-            else:
-                st.error("No arbitrage data available for analysis.")
-
+            st.success("Price comparison completed successfully.")
         else:
-            st.warning("Price comparison data is empty.")
-            logger.warning("No price comparison data available.")
+            st.warning("No significant price differences found.")
     else:
-        st.warning("Cannot perform price comparisons: Uniswap or Pyth data missing.")
-        logger.warning("Comparison failed due to missing Uniswap or Pyth data.")
+        st.warning("Missing Pyth or Uniswap data. Fetch both to compare prices.")
+
 
 if __name__ == "__main__":
     streamlit_app()

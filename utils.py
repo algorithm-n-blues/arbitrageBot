@@ -1,5 +1,7 @@
 import pandas as pd
-from datetime import datetime
+import streamlit as st
+from datetime import datetime, timedelta
+import os
 import logging
 
 # Initialize logger
@@ -26,35 +28,63 @@ def standardize_symbol(symbol):
 
 # Compare prices between Uniswap and Pyth
 def compare_prices(uniswap_data, pyth_data):
+    """
+    Compare Uniswap and Pyth prices, calculate deviations, weighted TVL, and potential profits.
+    """
+    logger.info("Starting price comparison and TVL calculations.")
+    
+    # Prepare Pyth data lookup
+    pyth_dict = {item["symbol"].upper().strip(): item["Price"] for item in pyth_data}
     comparison_data = []
-    pyth_dict = {item["symbol"]: item["Price"] for item in pyth_data}
 
     for pool in uniswap_data:
         try:
-            token0_symbol = standardize_symbol(pool["token0"]["symbol"])
-            token1_symbol = standardize_symbol(pool["token1"]["symbol"])
+            token0_symbol = pool["token0_symbol"].upper().strip()
+            token1_symbol = pool["token1_symbol"].upper().strip()
             uniswap_tvl = float(pool.get("totalValueLockedUSD", 0))
 
+            # Fetch Pyth prices
             pyth_price_token0 = pyth_dict.get(token0_symbol, None)
             pyth_price_token1 = pyth_dict.get(token1_symbol, None)
 
-            if pyth_price_token0 and pyth_price_token1:
-                # Calculate weighted TVL and deviation
-                weighted_tvl = pyth_price_token0 + pyth_price_token1
-                deviation = abs(weighted_tvl - uniswap_tvl) / uniswap_tvl * 100 if uniswap_tvl > 0 else 0
+            if pyth_price_token0 is None or pyth_price_token1 is None:
+                logger.warning(f"Missing Pyth price for token0: {token0_symbol} or token1: {token1_symbol}. Skipping pool.")
+                continue
 
-                comparison_data.append({
-                    "Pool": f"{token0_symbol}/{token1_symbol}",
-                    "Pyth Price Token0": pyth_price_token0,
-                    "Pyth Price Token1": pyth_price_token1,
-                    "Uniswap TVL": uniswap_tvl,
-                    "Weighted Pyth TVL": weighted_tvl,
-                    "Deviation (%)": deviation
-                })
+            # Price differences
+            token0_price_diff = abs(pyth_price_token0 - float(pool["token0Price"]))
+            token1_price_diff = abs(pyth_price_token1 - float(pool["token1Price"]))
+
+            # TVL calculations
+            token0_tvl = float(pool.get("totalValueLockedToken0", 0)) * pyth_price_token0
+            token1_tvl = float(pool.get("totalValueLockedToken1", 0)) * pyth_price_token1
+            weighted_tvl = token0_tvl + token1_tvl
+            deviation = abs(weighted_tvl - uniswap_tvl) / uniswap_tvl * 100 if uniswap_tvl > 0 else 0
+
+            # Profit estimations
+            token0_profit = token0_price_diff * float(pool.get("totalValueLockedToken0", 0))
+            token1_profit = token1_price_diff * float(pool.get("totalValueLockedToken1", 0))
+
+            # Append results
+            comparison_data.append({
+                "Pool": f"{token0_symbol}/{token1_symbol}",
+                "Pyth Price Token0": pyth_price_token0,
+                "Pyth Price Token1": pyth_price_token1,
+                "Uniswap Token0 Price": float(pool["token0Price"]),
+                "Uniswap Token1 Price": float(pool["token1Price"]),
+                "Price Diff Token0": token0_price_diff,
+                "Price Diff Token1": token1_price_diff,
+                "Uniswap TVL": uniswap_tvl,
+                "Weighted Pyth TVL": weighted_tvl,
+                "Deviation (%)": deviation,
+                "Token0 Profit": token0_profit,
+                "Token1 Profit": token1_profit,
+            })
         except Exception as e:
-            print(f"Error processing pool: {e}")
+            logger.error(f"Error processing pool {pool.get('id', 'unknown')}: {e}", exc_info=True)
             continue
 
+    logger.info(f"Comparison completed for {len(comparison_data)} pools.")
     return pd.DataFrame(comparison_data)
 
 def calculate_price_difference(uniswap_data, pyth_data):
@@ -69,6 +99,9 @@ def calculate_price_difference(uniswap_data, pyth_data):
         pd.DataFrame: DataFrame with price comparisons.
     """
     logger.info("Starting price comparison between Uniswap and Pyth data.")
+    # Add this at the start of `calculate_price_difference`
+    logger.debug(f"Uniswap data for price comparison: {uniswap_data[:3]}")  # Log the first 3 pools
+
 
     # Convert Pyth data to DataFrame and normalize symbols
     pyth_df = pd.DataFrame(pyth_data)
@@ -78,8 +111,21 @@ def calculate_price_difference(uniswap_data, pyth_data):
 
     for pool in uniswap_data:
         try:
-            token0_symbol = pool["token0_symbol"].upper().strip()
-            token1_symbol = pool["token1_symbol"].upper().strip()
+
+            if "token0_symbol" not in pool or "token1_symbol" not in pool:
+                logger.error(f"Missing symbols in pool data: {pool}")
+                continue
+
+            token0_symbol = pool.get("token0_symbol", "MISSING").upper().strip()
+            token1_symbol = pool.get("token1_symbol", "MISSING").upper().strip()
+
+            if token0_symbol == "MISSING" or token1_symbol == "MISSING":
+                logger.error(f"Missing symbols in pool: {pool}")
+                continue
+
+            # Fetch Uniswap prices (token1 per token0 and vice versa)
+            uniswap_price_token1_per_token0 = float(pool.get("price_token1_per_token0", 0))
+            uniswap_price_token0_per_token1 = 1 / uniswap_price_token1_per_token0 if uniswap_price_token1_per_token0 > 0 else 0
 
             # Get Pyth prices for token0 and token1
             pyth_price_token0 = pyth_df.loc[pyth_df["symbol"] == token0_symbol, "Price"].values
@@ -92,10 +138,11 @@ def calculate_price_difference(uniswap_data, pyth_data):
                 logger.warning(f"Missing Pyth price for token0: {token0_symbol} or token1: {token1_symbol}. Skipping pool.")
                 continue
 
-            # Calculate deviations
-            token0_diff = abs(pyth_price_token0 - float(pool["token0Price"]))
-            token1_diff = abs(pyth_price_token1 - float(pool["token1Price"]))
+            # Calculate price deviations
+            token0_diff = abs(pyth_price_token0 - uniswap_price_token0_per_token1)
+            token1_diff = abs(pyth_price_token1 - uniswap_price_token1_per_token0)
 
+            # Calculate TVLs and deviations
             uniswap_tvl = float(pool.get("totalValueLockedUSD", 0))
             token0_tvl = float(pool.get("totalValueLockedToken0", 0)) * pyth_price_token0
             token1_tvl = float(pool.get("totalValueLockedToken1", 0)) * pyth_price_token1
@@ -106,12 +153,13 @@ def calculate_price_difference(uniswap_data, pyth_data):
             token0_profit = token0_diff * float(pool.get("totalValueLockedToken0", 0))
             token1_profit = token1_diff * float(pool.get("totalValueLockedToken1", 0))
 
+            # Append pool comparison data
             comparison_data.append({
                 "Pool": f"{token0_symbol}/{token1_symbol}",
                 "Pyth Price Token0": pyth_price_token0,
                 "Pyth Price Token1": pyth_price_token1,
-                "Uniswap Token0 Price": float(pool["token0Price"]),
-                "Uniswap Token1 Price": float(pool["token1Price"]),
+                "Uniswap Token0 Price (derived)": uniswap_price_token0_per_token1,
+                "Uniswap Token1 Price (derived)": uniswap_price_token1_per_token0,
                 "Price Diff Token0": token0_diff,
                 "Price Diff Token1": token1_diff,
                 "Uniswap TVL": uniswap_tvl,
@@ -279,13 +327,88 @@ def calculate_flash_loan_profitability(arbitrage_df):
     logger.info(f"Flash Loan Profitability Analysis completed with {len(profit_df)} entries.")
     return profit_df
 
-def calculate_weighted_tvl(comparison_df):
+def calculate_weighted_tvl(df):
     """
-    Calculate or ensure Weighted Pyth TVL is available in the DataFrame.
+    Calculate Weighted Pyth TVL for each pool and add it as a column.
+
+    Weighted Pyth TVL = (token0_price * totalValueLockedToken0) + (token1_price * totalValueLockedToken1)
+
+    Args:
+        df (DataFrame): DataFrame containing Uniswap and Pyth data.
+
+    Returns:
+        DataFrame: DataFrame with the new 'Weighted Pyth TVL' column added.
     """
-    if "Weighted Pyth TVL" not in comparison_df.columns:
-        comparison_df["Weighted Pyth TVL"] = (
-            comparison_df["Pyth Price Token0"] * comparison_df["Uniswap Token0 Price"]
-            + comparison_df["Pyth Price Token1"] * comparison_df["Uniswap Token1 Price"]
-        ).fillna(1_000_000)  # Fallback to $1M if missing
-    return comparison_df
+    required_columns = ["token0_price", "token1_price", "totalValueLockedToken0", "totalValueLockedToken1"]
+
+    # Verify all required columns exist
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        logger.error(f"Missing columns for Weighted Pyth TVL calculation: {missing_columns}")
+        st.error(f"Missing columns for TVL calculation: {missing_columns}")
+        return df  # Return DataFrame as-is if columns are missing
+
+    try:
+        # Ensure numeric conversion for calculations
+        df["token0_price"] = pd.to_numeric(df["token0_price"], errors="coerce")
+        df["token1_price"] = pd.to_numeric(df["token1_price"], errors="coerce")
+        df["totalValueLockedToken0"] = pd.to_numeric(df["totalValueLockedToken0"], errors="coerce")
+        df["totalValueLockedToken1"] = pd.to_numeric(df["totalValueLockedToken1"], errors="coerce")
+
+        # Perform the calculation
+        df["Weighted Pyth TVL"] = (
+            (df["token0_price"] * df["totalValueLockedToken0"]).fillna(0) +
+            (df["token1_price"] * df["totalValueLockedToken1"]).fillna(0)
+        )
+
+        logger.info("Successfully calculated Weighted Pyth TVL.")
+    except Exception as e:
+        logger.error(f"Error calculating Weighted Pyth TVL: {e}")
+        st.error(f"Error calculating Weighted Pyth TVL: {e}")
+
+    return df
+
+def filter_pyth_prices(uniswap_data, pyth_data):
+    """
+    Filter Uniswap pools to include only those with available Pyth prices.
+    Logs a warning for pools missing token prices and skips them.
+
+    Args:
+        uniswap_data (list): List of Uniswap pool dictionaries.
+        pyth_data (list): List of Pyth price dictionaries.
+
+    Returns:
+        list: Filtered list of Uniswap pools with valid token prices.
+    """
+    valid_pyth_symbols = set([price['symbol'] for price in pyth_data])  # Extract valid token symbols from Pyth data
+    filtered_pools = []
+
+    for pool in uniswap_data:
+        token0 = pool['token0_symbol']
+        token1 = pool['token1_symbol']
+
+        # Check if both tokens exist in Pyth prices
+        if token0 in valid_pyth_symbols and token1 in valid_pyth_symbols:
+            filtered_pools.append(pool)
+        else:
+            logger.warning(f"Missing Pyth price for token0: {token0} or token1: {token1}. Skipping pool.")
+
+    return filtered_pools
+
+def get_last_updated_time(filepath):
+    """
+    Check the last modified time of a file and return its timestamp.
+    """
+    if os.path.exists(filepath):
+        modified_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+        return modified_time.strftime("%Y-%m-%d %H:%M:%S"), modified_time
+    return None, None
+
+def is_file_outdated(filepath, days=1):
+    """
+    Check if a file is older than the specified number of days.
+    """
+    _, modified_time = get_last_updated_time(filepath)
+    if modified_time:
+        return datetime.now() - modified_time > timedelta(days=days)
+    return True
