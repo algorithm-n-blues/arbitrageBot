@@ -78,40 +78,35 @@ def fetch_top_uniswap_pools(url, first=50, order_by="totalValueLockedUSD", order
         processed_pools = []
         for pool in pools:
             try:
-                # Check and deserialize token0 and token1 if they are strings
-                if isinstance(pool["token0"], str):
-                    pool["token0"] = ast.literal_eval(pool["token0"])  # Convert string to dict
-                if isinstance(pool["token1"], str):
-                    pool["token1"] = ast.literal_eval(pool["token1"])  # Convert string to dict
+                # Skip pools with missing token data
+                if "token0" not in pool or "token1" not in pool or not pool["token0"] or not pool["token1"]:
+                    logger.warning(f"Skipping pool {pool.get('id', 'unknown')} due to missing token data.")
+                    continue
 
-                # Add token symbols for easier reference
-                pool["token0_symbol"] = pool["token0"]["symbol"]
-                pool["token1_symbol"] = pool["token1"]["symbol"]
-                assert "token0_symbol" in pool, f"Missing token0_symbol in pool: {pool}"
-                assert "token1_symbol" in pool, f"Missing token1_symbol in pool: {pool}"
-                
                 # Extract and flatten relevant fields
                 processed_pool = {
                     "id": pool["id"],
-                    "token0_symbol": pool["token0"]["symbol"],
-                    "token0_decimals": int(pool["token0"]["decimals"]),
-                    "token1_symbol": pool["token1"]["symbol"],
-                    "token1_decimals": int(pool["token1"]["decimals"]),
-                    "sqrtPrice": int(pool["sqrtPrice"]),
-                    "totalValueLockedUSD": float(pool["totalValueLockedUSD"]),
-                    "totalValueLockedToken0": float(pool["totalValueLockedToken0"]),
-                    "totalValueLockedToken1": float(pool["totalValueLockedToken1"]),
-                    "volumeUSD": float(pool["volumeUSD"]),
-                    "feeTier": int(pool["feeTier"]),
+                    "token0_symbol": pool["token0"].get("symbol", "UNKNOWN"),
+                    "token0_decimals": int(pool["token0"].get("decimals", 0)),
+                    "token1_symbol": pool["token1"].get("symbol", "UNKNOWN"),
+                    "token1_decimals": int(pool["token1"].get("decimals", 0)),
+                    "sqrtPrice": int(pool.get("sqrtPrice", 0)),
+                    "totalValueLockedUSD": float(pool.get("totalValueLockedUSD", 0)),
+                    "totalValueLockedToken0": float(pool.get("totalValueLockedToken0", 0)),
+                    "totalValueLockedToken1": float(pool.get("totalValueLockedToken1", 0)),
+                    "volumeUSD": float(pool.get("volumeUSD", 0)),
+                    "feeTier": int(pool.get("feeTier", 0)),
                 }
 
                 # Calculate derived prices
                 price_token1_per_token0 = calculate_uniswap_price(
                     processed_pool["sqrtPrice"],
                     processed_pool["token0_decimals"],
-                    processed_pool["token1_decimals"]
+                    processed_pool["token1_decimals"],
                 )
-                price_token0_per_token1 = 1 / price_token1_per_token0 if price_token1_per_token0 > 0 else 0
+                price_token0_per_token1 = (
+                    1 / price_token1_per_token0 if price_token1_per_token0 > 0 else 0
+                )
 
                 # Add derived prices
                 processed_pool["price_token1_per_token0"] = price_token1_per_token0
@@ -119,13 +114,13 @@ def fetch_top_uniswap_pools(url, first=50, order_by="totalValueLockedUSD", order
 
                 processed_pools.append(processed_pool)
             except Exception as e:
-                logger.warning(f"Error processing pool {pool['id']}: {e}")
+                logger.error(f"Error processing pool {pool.get('id', 'unknown')}: {e}", exc_info=True)
 
-        logger.info(f"Processed {len(processed_pools)} pools with derived prices.")
-        logger.debug(f"Fetched and processed pool data: {pools[:3]}")  # Log the first 3 entries
+        logger.info(f"Processed {len(processed_pools)} valid pools.")
+        logger.debug(f"Processed Pools: {processed_pools[:5]}")  # Log first 5 pools for debug
         return processed_pools
     except Exception as e:
-        # logger.error(f"Error fetching top pools from {url}: {str(e)}")
+        logger.error(f"Error fetching top pools from {url}: {e}", exc_info=True)
         return []
 
 def fetch_pool_details(pool_id):
@@ -205,48 +200,25 @@ def fetch_pool_details(pool_id):
         return None
 
 # Save Uniswap Data to CSV
-def save_uniswap_data_to_csv(pools, filename):
+def save_uniswap_data_to_csv(pools, file_path="data/uniswap_top_pools.csv"):
     """
-    Save Uniswap pool data to a CSV file.
+    Save processed Uniswap pool data to a CSV file.
 
     Args:
-        pools (list): List of pool data dictionaries.
-        filename (str): File path to save the CSV.
+        pools (list): List of processed pool data.
+        file_path (str): Path to the CSV file.
     """
-    if pools:
-        # Flatten the pool data to ensure all fields are included
-        flattened_pools = []
-        for pool in pools:
-            try:
-                flattened_pools.append({
-                    "id": pool["id"],
-                    "token0_symbol": pool["token0"]["symbol"],
-                    "token0_decimals": pool["token0"]["decimals"],
-                    "token1_symbol": pool["token1"]["symbol"],
-                    "token1_decimals": pool["token1"]["decimals"],
-                    "sqrtPrice": pool["sqrtPrice"],
-                    "totalValueLockedUSD": pool["totalValueLockedUSD"],
-                    "totalValueLockedToken0": pool["totalValueLockedToken0"],
-                    "totalValueLockedToken1": pool["totalValueLockedToken1"],
-                    "volumeUSD": pool["volumeUSD"],
-                    "feeTier": pool["feeTier"],
-                    "price_token1_per_token0": pool.get("price_token1_per_token0", 0),
-                    "price_token0_per_token1": pool.get("price_token0_per_token1", 0),
-                })
-            except Exception as e:
-                logger.warning(f"Error flattening pool data for pool {pool.get('id', 'unknown')}: {e}")
+    try:
+        if not pools:
+            logger.warning("No pool data available to save.")
+            return
 
-        # Convert flattened data to DataFrame
-        df = pd.DataFrame(flattened_pools)
-
-        # Add timestamp
-        df = add_timestamp(df)
-
-        # Save to CSV
-        df.to_csv(filename, index=False)
-        logger.info(f"Uniswap pools data saved to {filename}")
-    else:
-        logger.error("No Uniswap pools data to save.")
+        df = pd.DataFrame(pools)
+        logger.debug(f"DataFrame Head:\n{df.head()}")  # Debug log for DataFrame
+        df.to_csv(file_path, index=False)
+        logger.info(f"Uniswap pools data saved to {file_path}")
+    except Exception as e:
+        logger.error(f"Error saving data to CSV: {e}", exc_info=True)
 
 def fetch_pool_volume_details(pool_id, uniswap_url, interval="15 seconds"):
     """

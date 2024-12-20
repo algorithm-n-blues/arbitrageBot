@@ -1,10 +1,10 @@
-import os
 import aiohttp
-import logging
-import pandas as pd
-import streamlit as st
 import asyncio
 from datetime import datetime
+import logging
+import os
+import pandas as pd
+import streamlit as st
 from uniswap_v3.fetch_uniswap import (
     save_uniswap_data_to_csv,
     fetch_top_uniswap_pools,
@@ -175,7 +175,7 @@ def streamlit_app():
     # Display Uniswap data if exists
     if os.path.exists(uniswap_file):
         uniswap_df = pd.read_csv(uniswap_file)
-
+        logger.debug(f"Uniswap Data: {uniswap_df}")
         # Ensure derived price columns are present
         if "price_token1_per_token0" in uniswap_df.columns and "price_token0_per_token1" in uniswap_df.columns:
             st.dataframe(uniswap_df)
