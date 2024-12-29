@@ -1,5 +1,4 @@
 import pandas as pd
-import streamlit as st
 from datetime import datetime, timedelta
 import os
 import logging
@@ -87,21 +86,43 @@ def compare_prices(uniswap_data, pyth_data):
     logger.info(f"Comparison completed for {len(comparison_data)} pools.")
     return pd.DataFrame(comparison_data)
 
-def calculate_price_difference(uniswap_data, pyth_data):
+def calculate_price_difference(uniswap_data, pyth_data, token_pair=None):
     """
-    Compare Uniswap and Pyth prices and calculate differences.
+    Compare Uniswap and Pyth prices and calculate differences. 
+    Optionally, directly compare two price values for simpler use cases.
 
     Args:
         uniswap_data (list): Uniswap pool data.
         pyth_data (list): Pyth Network price data.
+        token_pair (tuple, optional): A tuple of (pyth_price, uniswap_price) for direct comparison.
 
     Returns:
-        pd.DataFrame: DataFrame with price comparisons.
+        pd.DataFrame or dict: DataFrame with price comparisons or direct comparison results for token_pair.
     """
-    logger.info("Starting price comparison between Uniswap and Pyth data.")
-    # Add this at the start of `calculate_price_difference`
-    logger.debug(f"Uniswap data for price comparison: {uniswap_data[:3]}")  # Log the first 3 pools
+    if token_pair:
+        # Simple price comparison mode for (pyth_price, uniswap_price)
+        try:
+            pyth_price, uniswap_price = token_pair
+            if pyth_price <= 0 or uniswap_price <= 0:
+                raise ValueError("Prices must be greater than zero for comparison.")
+            
+            absolute_diff = abs(pyth_price - uniswap_price)
+            percentage_diff = (absolute_diff / pyth_price) * 100
 
+            logger.debug(f"Direct Comparison - Pyth: {pyth_price}, Uniswap: {uniswap_price}, "
+                         f"Absolute Diff: {absolute_diff}, Percentage Diff: {percentage_diff:.2f}%")
+
+            return {
+                "absolute_diff": absolute_diff,
+                "percentage_diff": percentage_diff,
+            }
+        except Exception as e:
+            logger.error(f"Error in calculate_price_difference (direct comparison): {e}")
+            return {"absolute_diff": Decimal(0), "percentage_diff": Decimal(0)}
+
+    # Full pool comparison mode
+    logger.info("Starting price comparison between Uniswap and Pyth data.")
+    logger.debug(f"Uniswap data for price comparison: {uniswap_data[:3]}")  # Log the first 3 pools
 
     # Convert Pyth data to DataFrame and normalize symbols
     pyth_df = pd.DataFrame(pyth_data)
@@ -111,7 +132,6 @@ def calculate_price_difference(uniswap_data, pyth_data):
 
     for pool in uniswap_data:
         try:
-
             if "token0_symbol" not in pool or "token1_symbol" not in pool:
                 logger.error(f"Missing symbols in pool data: {pool}")
                 continue
@@ -412,3 +432,111 @@ def is_file_outdated(filepath, days=1):
     if modified_time:
         return datetime.now() - modified_time > timedelta(days=days)
     return True
+
+from decimal import Decimal
+
+def calculate_trade_cost(amount, gas_price_gwei, gas_limit, slippage, fee_tier):
+    """
+    Calculate the total cost of a trade.
+
+    Args:
+        amount (Decimal): Amount of the token being traded.
+        gas_price_gwei (Decimal): Gas price in Gwei.
+        gas_limit (int or Decimal): Estimated gas limit for the trade.
+        slippage (Decimal): Slippage percentage (e.g., Decimal("0.005") for 0.5%).
+        fee_tier (Decimal): Uniswap fee tier percentage (e.g., Decimal("0.003") for 0.3%).
+
+    Returns:
+        dict: Dictionary containing detailed trade costs and total cost.
+    """
+    try:
+        # Ensure all inputs are Decimal for compatibility
+        if not isinstance(amount, Decimal):
+            amount = Decimal(amount)
+        if not isinstance(gas_price_gwei, Decimal):
+            gas_price_gwei = Decimal(gas_price_gwei)
+        if not isinstance(gas_limit, Decimal):
+            gas_limit = Decimal(gas_limit)
+        if not isinstance(slippage, Decimal):
+            slippage = Decimal(slippage)
+        if not isinstance(fee_tier, Decimal):
+            fee_tier = Decimal(fee_tier)
+
+        # Convert gas price from Gwei to ETH
+        gas_cost_eth = (gas_price_gwei * Decimal("1e-9")) * gas_limit
+
+        # Calculate slippage cost
+        slippage_cost = amount * slippage
+
+        # Calculate Uniswap fee cost
+        uniswap_fee = amount * fee_tier
+
+        # Total cost
+        total_cost = gas_cost_eth + slippage_cost + uniswap_fee
+
+        return {
+            "Gas Cost (ETH)": gas_cost_eth,
+            "Slippage Cost": slippage_cost,
+            "Uniswap Fee": uniswap_fee,
+            "Total Cost": total_cost
+        }
+    except Exception as e:
+        logger.error(f"Error calculating trade cost: {e}")
+        return {
+            "Gas Cost (ETH)": Decimal(0),
+            "Slippage Cost": Decimal(0),
+            "Uniswap Fee": Decimal(0),
+            "Total Cost": Decimal(0)
+        }
+
+# Save Uniswap Data to CSV
+def save_uniswap_data_to_csv(data, file_path="data/uniswap_top_pools.csv"):
+    """
+    Save Uniswap data to a CSV file.
+
+    Args:
+        data: Uniswap data as a list of dictionaries or a pandas DataFrame.
+        file_path (str): Path to save the CSV file.
+    """
+    try:
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+        if isinstance(data, pd.DataFrame):
+            if data.empty:
+                logger.warning("No data in DataFrame to save. Aborting save operation.")
+                return
+            logger.debug(f"Saving DataFrame to CSV with columns: {list(data.columns)}")
+            # Ensure proper formatting of token details
+            if "token0" in data.columns and "token1" in data.columns:
+                data["token0"] = data["token0"].apply(
+                    lambda x: x.get("symbol", "UNKNOWN") if isinstance(x, dict) else x
+                )
+                data["token1"] = data["token1"].apply(
+                    lambda x: x.get("symbol", "UNKNOWN") if isinstance(x, dict) else x
+                )
+            data.to_csv(file_path, index=False)
+
+        elif isinstance(data, list):
+            if not data:
+                logger.warning("No data in list to save. Aborting save operation.")
+                return
+            logger.debug("Saving list of dictionaries to CSV.")
+            df = pd.DataFrame(data)
+            # Ensure proper formatting for token details if keys exist
+            if "token0" in df.columns and "token1" in df.columns:
+                df["token0"] = df["token0"].apply(
+                    lambda x: x.get("symbol", "UNKNOWN") if isinstance(x, dict) else x
+                )
+                df["token1"] = df["token1"].apply(
+                    lambda x: x.get("symbol", "UNKNOWN") if isinstance(x, dict) else x
+                )
+            df.to_csv(file_path, index=False)
+
+        else:
+            logger.error("Unsupported data format. Data must be a DataFrame or a list of dictionaries.")
+            return
+
+        logger.info(f"Uniswap data successfully saved to {file_path}")
+    except Exception as e:
+        logger.error(f"Error saving data to CSV: {e}", exc_info=True)

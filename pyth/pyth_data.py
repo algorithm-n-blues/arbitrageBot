@@ -86,3 +86,31 @@ def save_pyth_data_to_csv(pyth_data, filename):
         logging.info(f"Pyth Network price data saved to {filename}")
     else:
         logging.error("No Pyth Network data to save.")
+
+def get_eth_usd_price():
+    """
+    Fetch and return the ETH/USD price from Pyth Network.
+    """
+    eth_usd_id = pyth_keys.get("ETH/USD")
+    if not eth_usd_id:
+        logging.error("ETH/USD key not found in Pyth keys.")
+        return None
+
+    async def fetch_eth_price():
+        async with aiohttp.ClientSession() as session:
+            try:
+                endpoint = "/v2/updates/price/latest"
+                async with session.get(
+                    f"{HERMES_BASE_URL}{endpoint}",
+                    params={"ids[]": eth_usd_id, "parsed": "true"}
+                ) as response:
+                    response.raise_for_status()
+                    json_data = await response.json()
+                    price_data = json_data["parsed"][0]["price"]
+                    price = float(price_data["price"]) * (10 ** price_data["expo"])
+                    return price
+            except Exception as e:
+                logging.error(f"Failed to fetch ETH/USD price: {e}")
+                return None
+
+    return asyncio.run(fetch_eth_price())

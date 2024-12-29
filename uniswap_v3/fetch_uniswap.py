@@ -4,6 +4,7 @@ import ast
 import pandas as pd
 from utils import add_timestamp
 from decimal import Decimal
+from math import sqrt
 
 # Logger setup for debugging
 logger = logging.getLogger(__name__)
@@ -16,21 +17,26 @@ logger.addHandler(handler)
 API_KEY = "e12c2830e44d2ed329aa22ec5a73fb81"  # Replace with your Graph Gateway API key
 UNISWAP_ARBITRUM_URL = f"https://gateway.thegraph.com/api/{API_KEY}/subgraphs/id/5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV"
 
-def calculate_uniswap_price(sqrtPriceX96, decimals0, decimals1):
+def calculate_uniswap_price(sqrt_price, decimals0, decimals1):
     """
-    Calculate the price from Uniswap V3 sqrtPriceX96.
+    Calculate Uniswap price from sqrtPriceX96.
 
     Args:
-        sqrtPriceX96 (int): The sqrtPriceX96 value from Uniswap.
-        decimals0 (int): Number of decimals for token0.
-        decimals1 (int): Number of decimals for token1.
+        sqrt_price (int): SqrtPriceX96 value.
+        decimals0 (int): Decimals for token0.
+        decimals1 (int): Decimals for token1.
 
     Returns:
-        float: The calculated price of token1/token0.
+        float: Derived price of token1 per token0.
     """
-    price = (Decimal(sqrtPriceX96) / (2**96))**2
-    adjusted_price = float(price) * 10**(decimals0 - decimals1)
-    return adjusted_price
+    try:
+        if sqrt_price == 0:
+            return 0
+        price = (sqrt(sqrt_price / (2**96)) ** 2) * (10 ** (decimals0 - decimals1))
+        return price
+    except Exception as e:
+        logger.error(f"Error calculating Uniswap price: {e}")
+        return 0
 
 # Fetch Top Pools from Uniswap
 def fetch_top_uniswap_pools(url, first=50, order_by="totalValueLockedUSD", order_direction="desc"):
@@ -44,7 +50,7 @@ def fetch_top_uniswap_pools(url, first=50, order_by="totalValueLockedUSD", order
         order_direction (str): Sort direction ("asc" or "desc").
 
     Returns:
-        list: List of pool data dictionaries, including derived prices.
+        DataFrame: Processed pool data with derived prices and 'pair' column.
     """
     query = f"""
     {{
@@ -53,10 +59,12 @@ def fetch_top_uniswap_pools(url, first=50, order_by="totalValueLockedUSD", order
         token0 {{
           symbol
           decimals
+          id
         }}
         token1 {{
           symbol
           decimals
+          id
         }}
         sqrtPrice
         totalValueLockedUSD
@@ -69,27 +77,35 @@ def fetch_top_uniswap_pools(url, first=50, order_by="totalValueLockedUSD", order
     """
 
     try:
+        # Request data from The Graph API
         response = requests.post(url, json={"query": query})
         response.raise_for_status()
         data = response.json()
+
+        # Check for unexpected API response structure
+        if "data" not in data or "pools" not in data["data"]:
+            logger.error("Unexpected response structure from Uniswap API.")
+            return pd.DataFrame()
+
         pools = data["data"]["pools"]
 
-        # Flatten and process each pool
+        # Process and flatten pool data
         processed_pools = []
         for pool in pools:
-            try:
-                # Skip pools with missing token data
-                if "token0" not in pool or "token1" not in pool or not pool["token0"] or not pool["token1"]:
-                    logger.warning(f"Skipping pool {pool.get('id', 'unknown')} due to missing token data.")
-                    continue
+            # Skip pools with missing token data
+            if not pool.get("token0") or not pool.get("token1"):
+                logger.warning(f"Skipping pool {pool.get('id', 'unknown')} due to missing token data.")
+                continue
 
-                # Extract and flatten relevant fields
+            try:
                 processed_pool = {
                     "id": pool["id"],
-                    "token0_symbol": pool["token0"].get("symbol", "UNKNOWN"),
+                    "token0_symbol": pool["token0"].get("symbol", "UNKNOWN").upper(),
                     "token0_decimals": int(pool["token0"].get("decimals", 0)),
-                    "token1_symbol": pool["token1"].get("symbol", "UNKNOWN"),
+                    "token0_id": pool["token0"].get("id", ""),
+                    "token1_symbol": pool["token1"].get("symbol", "UNKNOWN").upper(),
                     "token1_decimals": int(pool["token1"].get("decimals", 0)),
+                    "token1_id": pool["token1"].get("id", ""),
                     "sqrtPrice": int(pool.get("sqrtPrice", 0)),
                     "totalValueLockedUSD": float(pool.get("totalValueLockedUSD", 0)),
                     "totalValueLockedToken0": float(pool.get("totalValueLockedToken0", 0)),
@@ -108,20 +124,27 @@ def fetch_top_uniswap_pools(url, first=50, order_by="totalValueLockedUSD", order
                     1 / price_token1_per_token0 if price_token1_per_token0 > 0 else 0
                 )
 
-                # Add derived prices
+                # Add derived prices and pair column
                 processed_pool["price_token1_per_token0"] = price_token1_per_token0
                 processed_pool["price_token0_per_token1"] = price_token0_per_token1
+                processed_pool["pair"] = f"{processed_pool['token0_symbol']}/{processed_pool['token1_symbol']}"
 
                 processed_pools.append(processed_pool)
+
             except Exception as e:
                 logger.error(f"Error processing pool {pool.get('id', 'unknown')}: {e}", exc_info=True)
 
+        # Log summary and return DataFrame
         logger.info(f"Processed {len(processed_pools)} valid pools.")
         logger.debug(f"Processed Pools: {processed_pools[:5]}")  # Log first 5 pools for debug
-        return processed_pools
+        return pd.DataFrame(processed_pools)
+
+    except requests.RequestException as e:
+        logger.error(f"Request error fetching top pools from {url}: {e}", exc_info=True)
+        return pd.DataFrame()
     except Exception as e:
-        logger.error(f"Error fetching top pools from {url}: {e}", exc_info=True)
-        return []
+        logger.error(f"Unexpected error in fetch_top_uniswap_pools: {e}", exc_info=True)
+        return pd.DataFrame()
 
 def fetch_pool_details(pool_id):
     """
@@ -198,27 +221,6 @@ def fetch_pool_details(pool_id):
     except Exception as e:
         logger.error(f"Error fetching pool details for {pool_id}: {str(e)}")
         return None
-
-# Save Uniswap Data to CSV
-def save_uniswap_data_to_csv(pools, file_path="data/uniswap_top_pools.csv"):
-    """
-    Save processed Uniswap pool data to a CSV file.
-
-    Args:
-        pools (list): List of processed pool data.
-        file_path (str): Path to the CSV file.
-    """
-    try:
-        if not pools:
-            logger.warning("No pool data available to save.")
-            return
-
-        df = pd.DataFrame(pools)
-        logger.debug(f"DataFrame Head:\n{df.head()}")  # Debug log for DataFrame
-        df.to_csv(file_path, index=False)
-        logger.info(f"Uniswap pools data saved to {file_path}")
-    except Exception as e:
-        logger.error(f"Error saving data to CSV: {e}", exc_info=True)
 
 def fetch_pool_volume_details(pool_id, uniswap_url, interval="15 seconds"):
     """

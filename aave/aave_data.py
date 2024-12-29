@@ -17,44 +17,76 @@ ARBISCAN_API_KEY = 'your_arbiscan_api_key_here'
 
 # Updated fetch_aave_data function
 async def fetch_aave_data(session, use_local=False):
+    """
+    Fetch data from Aave API or local file and return as a processed DataFrame.
+
+    Args:
+        session (aiohttp.ClientSession): The aiohttp session for API requests.
+        use_local (bool): Flag to load data from a local file.
+
+    Returns:
+        DataFrame: A DataFrame containing processed Aave reserve data.
+    """
     if use_local:
         try:
             with open('./data/aave_data.json', 'r') as file:
                 aave_data = json.load(file)
             logging.info("Aave data loaded from local file.")
-            return aave_data
+            logging.debug(f"Raw local Aave data: {aave_data}")
+            reserves_df = pd.DataFrame(aave_data.get("reserves", []))
         except FileNotFoundError:
             logging.error("Local Aave data file not found.")
-            return None
+            return pd.DataFrame()
+    else:
+        url = "https://aave-api-v2.aave.com/data/markets-data"
+        try:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                aave_data = await response.json()
+                logging.info("Aave data fetched successfully from API.")
+                #logging.debug(f"Raw API Aave data: {aave_data}")
+                reserves_df = pd.DataFrame(aave_data.get("reserves", []))
+        except aiohttp.ClientError as e:
+            logging.error(f"Error fetching Aave data: {e}")
+            return pd.DataFrame()
+        except Exception as e:
+            logging.error(f"Unexpected error while fetching Aave data: {e}")
+            return pd.DataFrame()
 
-    url = "https://aave-api-v2.aave.com/data/markets-data"
     try:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            aave_data = await response.json()
-            logging.info("Aave data fetched successfully from API.")
-            
-            # Sort reserves by total liquidity and select top 10
-            sorted_reserves = sorted(aave_data.get('reserves', []), key=lambda x: float(x.get('totalLiquidityUSD', 0)), reverse=True)[:10]
-            
-            # Fetch token names and update the data
-            for reserve in sorted_reserves:
-                #logging.debug(f"Processing reserve: {reserve}")
-                token_address = reserve.get('underlyingAsset')
-                
-                if token_address:
-                    reserve['token_name'] = await get_token_name_ethereum(session, token_address)
-                else:
-                    reserve['token_name'] = 'Unknown'
+        # Convert relevant columns to numeric types
+        numeric_columns = [
+            "totalLiquidity", "totalLiquidityUSD", "totalBorrows",
+            "totalBorrowsUSD", "liquidityRate", "variableBorrowRate",
+            "stableBorrowRate"
+        ]
+        for column in numeric_columns:
+            if column in reserves_df.columns:
+                reserves_df[column] = pd.to_numeric(reserves_df[column], errors="coerce")
 
-            # Only include the selected reserves in the final data
-            aave_data['reserves'] = sorted_reserves
+        # Add calculated 'availableLiquidity' column
+        if not reserves_df.empty:
+            reserves_df["availableLiquidity"] = reserves_df["totalLiquidity"] - reserves_df["totalBorrows"]
 
-            return aave_data
+        # Add token names for clarity
+        for index, reserve in reserves_df.iterrows():
+            token_address = reserve.get("underlyingAsset")
+            reserves_df.at[index, "token_name"] = (
+                await get_token_name_ethereum(session, token_address)
+                if token_address else "Unknown"
+            )
 
-    except aiohttp.ClientError as e:
-        logging.error(f"Error fetching Aave data: {e}")
-        return None
+        # Debugging the processed DataFrame
+        logging.debug(f"Processed reserves with numeric conversion and token names:\n{reserves_df.head()}")
+
+        return reserves_df
+
+    except KeyError as e:
+        logging.error(f"KeyError while processing Aave data: {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        logging.error(f"Unexpected error while processing Aave data: {e}")
+        return pd.DataFrame()
     
 def get_best_tokens_for_flash_loans(aave_data):
     try:
