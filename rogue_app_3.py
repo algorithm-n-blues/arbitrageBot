@@ -9,8 +9,9 @@ from decimal import Decimal
 from decouple import config
 from aave.aave_data import fetch_aave_data
 from pyth.pyth_data import get_pyth_data
-from uniswap_v3.fetch_uniswap import fetch_top_uniswap_pools
+from uniswap_v3.fetch_uniswap import fetch_top_uniswap_pools, calculate_uniswap_price
 from utils import save_uniswap_data_to_csv
+from arbitrage.analyze_opportunities import calculate_opportunities_with_deviation
 
 # Initialize logger
 logging.basicConfig(
@@ -35,39 +36,56 @@ def fetch_and_process_uniswap_data():
     logger.info("Fetching Uniswap pool data...")
     uniswap_data = fetch_top_uniswap_pools(UNISWAP_ARBITRUM_URL)
 
+    if uniswap_data.empty:
+        logger.warning("No data fetched from Uniswap pools.")
+        return uniswap_data
+
     # Ensure sqrtPrice values are non-zero
+    logger.debug("Filtering out pools with sqrtPrice <= 0...")
     uniswap_data = uniswap_data[uniswap_data["sqrtPrice"] > 0]
 
-    # Calculate adjusted prices using sqrtPrice
-    uniswap_data["adjusted_price_token1_per_token0"] = (
-        (uniswap_data["sqrtPrice"] / (2 ** 96)) ** 2
-    )
-    uniswap_data["adjusted_price_token0_per_token1"] = 1 / uniswap_data["adjusted_price_token1_per_token0"]
+    if uniswap_data.empty:
+        logger.warning("No valid pools with non-zero sqrtPrice.")
+        return uniswap_data
 
-    # Validate calculations by considering token decimals
-    uniswap_data["adjusted_price_token1_per_token0_scaled"] = (
-        uniswap_data["adjusted_price_token1_per_token0"] / (10 ** uniswap_data["token1_decimals"])
+    # Calculate token prices using corrected logic
+    logger.info("Calculating token prices...")
+    uniswap_data["price_token1_per_token0"] = uniswap_data.apply(
+        lambda row: calculate_uniswap_price(
+            row["sqrtPrice"], row["token0_decimals"], row["token1_decimals"]
+        ) if row["sqrtPrice"] > 0 else None,
+        axis=1,
     )
-    uniswap_data["adjusted_price_token0_per_token1_scaled"] = (
-        uniswap_data["adjusted_price_token0_per_token1"] / (10 ** uniswap_data["token0_decimals"])
+    uniswap_data["price_token0_per_token1"] = uniswap_data["price_token1_per_token0"].apply(
+        lambda x: round(1 / x, 8) if x and x > 0 else None
     )
+
+    # Log all relevant intermediate values
+    logger.debug("Intermediate price calculations:")
+    for index, row in uniswap_data.iterrows():
+        logger.debug(
+            f"Pool {row['id']} - Pair: {row['token0_symbol']}/{row['token1_symbol']}, "
+            f"SqrtPrice: {row['sqrtPrice']}, Decimals0: {row['token0_decimals']}, "
+            f"Decimals1: {row['token1_decimals']}, "
+            f"Token1/Token0 Price: {row['price_token1_per_token0']}, "
+            f"Token0/Token1 Price: {row['price_token0_per_token1']}"
+        )
+
+    # Identify and log invalid price calculations
+    invalid_prices = uniswap_data[uniswap_data["price_token1_per_token0"].isna() | (uniswap_data["price_token1_per_token0"] <= 0)]
+    if not invalid_prices.empty:
+        logger.warning("Invalid prices detected:")
+        for index, row in invalid_prices.iterrows():
+            logger.warning(
+                f"Invalid Pool {row['id']} - Pair: {row['token0_symbol']}/{row['token1_symbol']}, "
+                f"SqrtPrice: {row['sqrtPrice']}, Decimals0: {row['token0_decimals']}, "
+                f"Decimals1: {row['token1_decimals']}"
+            )
 
     # Add a calculated constant_k column
     uniswap_data["constant_k"] = (
         uniswap_data["totalValueLockedToken0"] * uniswap_data["totalValueLockedToken1"]
     )
-
-    # Log for debugging
-    logger.debug("Logging detailed price calculations for Uniswap pools...")
-    for index, row in uniswap_data.iterrows():
-        logger.debug(
-            f"Pool {row['id']}: sqrtPrice={row['sqrtPrice']}, "
-            f"Price (Token1/Token0)={row['adjusted_price_token1_per_token0']}, "
-            f"Scaled Price (Token1/Token0)={row['adjusted_price_token1_per_token0_scaled']}, "
-            f"Price (Token0/Token1)={row['adjusted_price_token0_per_token1']}, "
-            f"Scaled Price (Token0/Token1)={row['adjusted_price_token0_per_token1_scaled']}, "
-            f"Constant k={row['constant_k']}"
-        )
 
     # Validate TVL calculations
     uniswap_data["calculated_tvl_usd"] = (
@@ -75,13 +93,16 @@ def fetch_and_process_uniswap_data():
         uniswap_data["totalValueLockedToken1"] * uniswap_data["price_token1_per_token0"]
     )
 
-    # Log discrepancies in x*y=k relationships
-    logger.debug("Validating x*y=k relationships for Uniswap pools...")
-    for index, row in uniswap_data.iterrows():
-        expected_k = row["totalValueLockedToken0"] * row["totalValueLockedToken1"]
-        calculated_k = row["constant_k"]
-        if abs(expected_k - calculated_k) > 1e-10:
-            logger.warning(f"Discrepancy in x*y=k for pool {row['id']}: Expected {expected_k}, Calculated {calculated_k}")
+    # Log edge cases
+    extreme_prices = uniswap_data[(uniswap_data["price_token1_per_token0"] < 1e-12) | (uniswap_data["price_token1_per_token0"] > 1e12)]
+    if not extreme_prices.empty:
+        logger.info("Pools with extreme price values:")
+        for index, row in extreme_prices.iterrows():
+            logger.info(
+                f"Extreme Pool {row['id']} - Pair: {row['token0_symbol']}/{row['token1_symbol']}, "
+                f"Token1/Token0 Price: {row['price_token1_per_token0']}, "
+                f"Token0/Token1 Price: {row['price_token0_per_token1']}"
+            )
 
     # Save Uniswap data to CSV
     uniswap_file = os.path.join(DATA_DIRECTORY, "uniswap_top_pools.csv")
@@ -135,7 +156,7 @@ def analyze_arbitrage_opportunities(pyth_data, uniswap_data, aave_data):
             expected_pool_price = token0_price / token1_price
 
             # Validate prices
-            token1_per_token0_uniswap = pool.get("adjusted_price_token1_per_token0_scaled", 0)
+            token1_per_token0_uniswap = pool.get("price_token1_per_token0", 0)
             if expected_pool_price == 0 or token1_per_token0_uniswap == 0:
                 logger.warning(
                     f"Invalid price detected for pool {token0_symbol}/{token1_symbol}. "
@@ -154,11 +175,11 @@ def analyze_arbitrage_opportunities(pyth_data, uniswap_data, aave_data):
             )
 
             # Skip high deviations or suspicious data
-            if price_deviation > 10000:
-                logger.warning(
-                    f"Skipping pool {token0_symbol}/{token1_symbol} due to excessive deviation: {price_deviation}%"
-                )
-                continue
+            #if price_deviation > 10000:
+            #    logger.warning(
+            #        f"Skipping pool {token0_symbol}/{token1_symbol} due to excessive deviation: {price_deviation}%"
+            #    )
+            #    continue
 
             # Check liquidity
             token0_aave = aave_data[aave_data["symbol"] == token0_symbol]
@@ -177,11 +198,9 @@ def analyze_arbitrage_opportunities(pyth_data, uniswap_data, aave_data):
                 "Token0 Symbol": token0_symbol,
                 "Token0 Pyth Price": token0_price,
                 "Token0 Confidence": token0_confidence,
-                "Token0 Uniswap Expected Price": token0_price,
                 "Token1 Symbol": token1_symbol,
                 "Token1 Pyth Price": token1_price,
                 "Token1 Confidence": token1_confidence,
-                "Token1 Uniswap Expected Price": token1_price,
                 "Expected Price (Token1/Token0)": expected_pool_price,
                 "Uniswap Price (Token1/Token0)": token1_per_token0_uniswap,
                 "Price Deviation (%)": round(price_deviation, 6),
@@ -226,9 +245,23 @@ def simulate_arbitrage():
         logger.warning(f"Insufficient data to simulate arbitrage. Missing datasets: {', '.join(missing_datasets)}")
         return
 
-    # Analyze opportunities
-    opportunities = analyze_arbitrage_opportunities(pyth_data, uniswap_data, aave_data)
-    logger.info(f"Simulation completed. Opportunities:\n{opportunities}")
+    # Analyze opportunities with deviation analysis
+    opportunities = calculate_opportunities_with_deviation(
+        pyth_data=pyth_data, 
+        uniswap_pools=uniswap_data, 
+        aave_data=aave_data, 
+        deviation_threshold=1.0  # Example threshold
+    )
+
+    if opportunities.empty:
+        logger.info("No profitable opportunities found with the given deviation threshold.")
+    else:
+        logger.info(f"Simulation completed. Opportunities:\n{opportunities}")
+
+    # Save results to CSV
+    opportunities_file = os.path.join(DATA_DIRECTORY, "arbitrage_opportunities_with_deviation.csv")
+    opportunities.to_csv(opportunities_file, index=False)
+    logger.info(f"Opportunities saved to {opportunities_file}")
 
 def main():
     simulate_arbitrage()

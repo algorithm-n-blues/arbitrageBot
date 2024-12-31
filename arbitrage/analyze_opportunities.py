@@ -209,6 +209,79 @@ def save_results_to_csv(results_df, filename):
     results_df.to_csv(file_path, index=False)
     logger.info(f"Results saved to {file_path}")
 
+def calculate_opportunities_with_deviation(pyth_data, uniswap_pools, aave_data, deviation_threshold=1.0):
+    """
+    Extended version of `calculate_opportunities` to include price deviation analysis 
+    and potential X->Y->Z trade paths.
+    
+    Args:
+        pyth_data (DataFrame): Pyth price data.
+        uniswap_pools (DataFrame): Uniswap pool data.
+        aave_data (DataFrame): Aave token data.
+        deviation_threshold (float): Minimum percentage deviation to consider for opportunities.
+    
+    Returns:
+        DataFrame: Opportunities with calculated deviations and potential profitability.
+    """
+    opportunities = []
+
+    # Normalize Pyth symbols
+    pyth_data["symbol"] = pyth_data["symbol"].str.upper().str.strip()
+
+    # Ensure required columns are present in Uniswap pools
+    required_columns = {"token0_symbol", "token1_symbol", "price_token1_per_token0"}
+    if not required_columns.issubset(uniswap_pools.columns):
+        logger.error(f"Missing expected columns in Uniswap pools: {required_columns - set(uniswap_pools.columns)}")
+        return pd.DataFrame()
+
+    # Normalize Aave symbols
+    if not aave_data.empty:
+        aave_data["symbol"] = aave_data["symbol"].str.upper().str.strip()
+
+    logger.debug("Analyzing price deviations for opportunities...")
+    for _, pool in uniswap_pools.iterrows():
+        pool_id = pool["id"]
+        token0_symbol = pool["token0_symbol"]
+        token1_symbol = pool["token1_symbol"]
+
+        if not token0_symbol or not token1_symbol:
+            logger.warning(f"Missing token symbols for pool {pool_id}. Skipping...")
+            continue
+
+        try:
+            # Retrieve Pyth prices
+            token0_pyth_price = Decimal(pyth_data[pyth_data["symbol"] == token0_symbol]["Price"].values[0])
+            token1_pyth_price = Decimal(pyth_data[pyth_data["symbol"] == token1_symbol]["Price"].values[0])
+
+            # Calculate expected price and compare with Uniswap price
+            expected_price = token0_pyth_price / token1_pyth_price
+            uniswap_price = Decimal(pool.get("price_token1_per_token0", 0))
+            deviation = abs(expected_price - uniswap_price) / expected_price * 100
+
+            #if deviation >= deviation_threshold:
+            # Log and prepare opportunity
+            logger.info(f"Significant deviation detected in {token0_symbol}/{token1_symbol}: {deviation}%")
+            opportunities.append({
+                "Pool ID": pool_id,
+                "Pair": f"{token0_symbol}/{token1_symbol}",
+                "Token0 Pyth Price": float(token0_pyth_price),
+                "Token1 Pyth Price": float(token1_pyth_price),
+                "Expected Price": float(expected_price),
+                "Uniswap Price": float(uniswap_price),
+                "Price Deviation (%)": float(deviation),
+            })
+
+            # Simulate X->Y->Z trade paths
+            # This section will calculate potential profitability for multi-token trades
+            # based on slippage and fees (add logic for trade path simulation as needed)
+
+        except Exception as e:
+            logger.error(f"Error processing pool {pool_id}: {e}")
+            continue
+
+    logger.info(f"Total opportunities found with deviation threshold {deviation_threshold}%: {len(opportunities)}")
+    return pd.DataFrame(opportunities)
+
 # Main Functionality
 def analyze_opportunities():
     """

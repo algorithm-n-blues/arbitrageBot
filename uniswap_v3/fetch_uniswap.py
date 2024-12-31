@@ -32,14 +32,15 @@ def calculate_uniswap_price(sqrt_price, decimals0, decimals1):
     try:
         if sqrt_price == 0:
             return 0
-        price = (sqrt(sqrt_price / (2**96)) ** 2) * (10 ** (decimals0 - decimals1))
-        return price
+        price_token1_per_token0 = (Decimal(sqrt_price) / (2 ** 96)) ** 2
+        adjusted_price = float(price_token1_per_token0) * 10 ** (decimals0 - decimals1)
+        return adjusted_price
     except Exception as e:
         logger.error(f"Error calculating Uniswap price: {e}")
         return 0
 
 # Fetch Top Pools from Uniswap
-def fetch_top_uniswap_pools(url, first=50, order_by="totalValueLockedUSD", order_direction="desc"):
+def fetch_top_uniswap_pools(url, first=100, order_by="totalValueLockedUSD", order_direction="desc"):
     """
     Fetch top pools from Uniswap using The Graph API and calculate derived prices.
 
