@@ -127,15 +127,15 @@ def analyze_arbitrage_opportunities(pyth_data, uniswap_data, aave_data):
             token0_confidence = token0_data["Price Confidence"].values[0]
             token1_confidence = token1_data["Price Confidence"].values[0]
 
-            # Adjust Pyth prices for token decimals
-            token0_price_adjusted = token0_price / (10 ** pool["token0_decimals"])
-            token1_price_adjusted = token1_price / (10 ** pool["token1_decimals"])
+            # Calculate expected price based on Pyth data without additional adjustments
+            if token1_price == 0:
+                logger.warning(f"Division by zero error for {token0_symbol}/{token1_symbol}. Skipping pool {pool_id}.")
+                continue
 
-            # Calculate expected price based on Pyth data
-            expected_pool_price = token0_price_adjusted / token1_price_adjusted
+            expected_pool_price = token0_price / token1_price
 
             # Validate prices
-            token1_per_token0_uniswap = pool.get("adjusted_price_token1_per_token0", 0)
+            token1_per_token0_uniswap = pool.get("adjusted_price_token1_per_token0_scaled", 0)
             if expected_pool_price == 0 or token1_per_token0_uniswap == 0:
                 logger.warning(
                     f"Invalid price detected for pool {token0_symbol}/{token1_symbol}. "
@@ -148,8 +148,8 @@ def analyze_arbitrage_opportunities(pyth_data, uniswap_data, aave_data):
 
             # Debug detailed price information
             logger.debug(
-                f"Pool: {token0_symbol}/{token1_symbol}, Token0 Price: {token0_price_adjusted}, "
-                f"Token1 Price: {token1_price_adjusted}, Expected Price: {expected_pool_price}, "
+                f"Pool: {token0_symbol}/{token1_symbol}, Token0 Price: {token0_price}, "
+                f"Token1 Price: {token1_price}, Expected Price: {expected_pool_price}, "
                 f"Uniswap Price: {token1_per_token0_uniswap}, Deviation: {price_deviation}%"
             )
 
@@ -177,11 +177,11 @@ def analyze_arbitrage_opportunities(pyth_data, uniswap_data, aave_data):
                 "Token0 Symbol": token0_symbol,
                 "Token0 Pyth Price": token0_price,
                 "Token0 Confidence": token0_confidence,
-                "Token0 Uniswap Expected Price": token0_price_adjusted,
+                "Token0 Uniswap Expected Price": token0_price,
                 "Token1 Symbol": token1_symbol,
                 "Token1 Pyth Price": token1_price,
                 "Token1 Confidence": token1_confidence,
-                "Token1 Uniswap Expected Price": token1_price_adjusted,
+                "Token1 Uniswap Expected Price": token1_price,
                 "Expected Price (Token1/Token0)": expected_pool_price,
                 "Uniswap Price (Token1/Token0)": token1_per_token0_uniswap,
                 "Price Deviation (%)": round(price_deviation, 6),
