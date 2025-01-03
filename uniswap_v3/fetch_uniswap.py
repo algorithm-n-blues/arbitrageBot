@@ -40,7 +40,7 @@ def calculate_uniswap_price(sqrt_price, decimals0, decimals1):
         return 0
 
 # Fetch Top Pools from Uniswap
-def fetch_top_uniswap_pools(url, first=100, order_by="totalValueLockedUSD", order_direction="desc"):
+def fetch_top_uniswap_pools(url, first=10, order_by="totalValueLockedUSD", order_direction="desc"):
     """
     Fetch top pools from Uniswap using The Graph API and calculate derived prices.
 
